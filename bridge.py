@@ -13,6 +13,7 @@ import os
 import signal
 import socket
 import struct
+import sys
 import threading
 import time
 import urllib.parse
@@ -45,6 +46,67 @@ def local_ip(target):
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
         s.connect((target, 1400))
         return s.getsockname()[0]
+
+def speaker_description(address):
+    """Verify a native Sonos description, never the virtual renderer we advertise."""
+    with OPENER.open('http://%s:1400/xml/device_description.xml' % address, timeout=2) as res:
+        device = xml(res.read(512000)).find('{*}device')
+    if device is None: return None
+    fields = {e.tag.split('}')[-1]: e.text or '' for e in device}
+    if ('sonos' not in fields.get('manufacturer', '').lower() or
+            fields.get('deviceType') != 'urn:schemas-upnp-org:device:ZonePlayer:1' or
+            not fields.get('UDN')): return None
+    return {'id': fields['UDN'], 'ip': address,
+            'name': fields.get('roomName') or fields.get('friendlyName') or address,
+            'model': fields.get('modelName', 'Sonos')}
+
+def discover_sonos(timeout=3, bind=None):
+    """Collect SSDP peers, then verify them on Sonos's fixed local HTTP port."""
+    peers = set()
+    message = (b'M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\n'
+               b'MAN: "ssdp:discover"\r\nMX: 1\r\n'
+               b'ST: urn:schemas-upnp-org:device:ZonePlayer:1\r\n\r\n')
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        if bind:
+            sock.bind((bind, 0))
+            sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton(bind))
+        sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
+        sock.sendto(message, ('239.255.255.250', 1900))
+        sock.sendto(message, ('239.255.255.250', 1900))
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            sock.settimeout(max(0.01, deadline - time.monotonic()))
+            try: data, peer = sock.recvfrom(8192)
+            except socket.timeout: break
+            address = ipaddress.ip_address(peer[0])
+            if data.startswith(b'HTTP/1.1 200') and address.is_private and not address.is_loopback:
+                if len(peers) < 64: peers.add(peer[0])
+    found = {}
+    for address in sorted(peers):
+        try:
+            speaker = speaker_description(address)
+            if speaker: found[speaker['id']] = speaker
+        except (OSError, ValueError, ET.ParseError):
+            continue
+    return sorted(found.values(), key=lambda item: (item['name'], item['id']))
+
+def select_sonos(speakers, speaker_id=None, interactive=False):
+    if speaker_id:
+        for speaker in speakers:
+            if speaker['id'] == speaker_id: return speaker
+        raise ValueError('Selected Sonos was not found. Check power, network, and multicast access.')
+    if not speakers:
+        raise ValueError('No Sonos found. Check the same LAN and multicast access, or use --target IP.')
+    if len(speakers) == 1: return speakers[0]
+    for index, speaker in enumerate(speakers, 1):
+        print('%d. %s (%s) — %s — %s' % (index, speaker['name'], speaker['model'], speaker['ip'], speaker['id']))
+    if not interactive:
+        raise ValueError('Multiple Sonos speakers found. Select one with --speaker ID or --target IP.')
+    try:
+        choice = int(input('Choose a room number: '))
+        if 1 <= choice <= len(speakers): return speakers[choice - 1]
+    except (ValueError, EOFError): pass
+    raise ValueError('Invalid room number.')
 
 def stype(service):
     return 'urn:schemas-upnp-org:service:' + service + ':1'
@@ -565,7 +627,10 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--target', required=True, help='Sonos IP address or hostname')
+    selection = parser.add_mutually_exclusive_group()
+    selection.add_argument('--target', help='Sonos IP address or hostname (default: auto-discover)')
+    selection.add_argument('--speaker', help='Stable Sonos device ID from --discover')
+    parser.add_argument('--discover', action='store_true', help='List available Sonos speakers and exit')
     parser.add_argument('--bind')
     parser.add_argument('--port', type=int, default=17863)
     parser.add_argument('--name', default='Sonos DLNA')
@@ -575,7 +640,19 @@ def main():
     LOG.setLevel(logging.INFO)
     handler = RotatingFileHandler(args.log, maxBytes=2_000_000, backupCount=2) if args.log else logging.StreamHandler()
     handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(message)s')); LOG.addHandler(handler)
-    target = socket.gethostbyname(args.target)
+    try:
+        selected = None
+        if args.discover or not args.target:
+            speakers = discover_sonos(bind=args.bind)
+            if args.discover:
+                for speaker in speakers:
+                    print('%s (%s) — %s — %s' % (speaker['name'], speaker['model'], speaker['ip'], speaker['id']))
+                if not speakers: parser.exit(1, 'No Sonos found on this network.\n')
+                return
+            selected = select_sonos(speakers, args.speaker, sys.stdin.isatty())
+        target = selected['ip'] if selected else socket.gethostbyname(args.target)
+    except (OSError, ValueError) as e:
+        parser.exit(1, str(e) + '\n')
     b = Bridge(target, args.bind or local_ip(target), args.port, args.name)
     if args.state:
         b.state_path = Path(args.state)
@@ -595,12 +672,16 @@ def main():
     def network_watch():
         while not b.stop.wait(30):
             try:
-                current_target = socket.gethostbyname(args.target)
+                if selected:
+                    current = select_sonos(discover_sonos(bind=args.bind), selected['id'])
+                    current_target = current['ip']
+                else:
+                    current_target = socket.gethostbyname(args.target)
                 current_host = args.bind or local_ip(current_target)
                 if (current_target, current_host) != (b.target, b.host):
                     LOG.info('Network address changed; restarting for rediscovery')
                     end(); return
-            except OSError:
+            except (OSError, ValueError):
                 pass
     threading.Thread(target=network_watch, daemon=True).start()
     LOG.info('Ready: %s at %s -> Sonos %s', b.name, b.base, b.target)

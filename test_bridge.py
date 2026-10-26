@@ -1,5 +1,6 @@
 """Protocol/stream tests using a fake speaker; never changes the real Sonos."""
 import collections
+import socket
 import struct
 import http.client
 import threading
@@ -9,8 +10,8 @@ import urllib.request
 import urllib.error
 import xml.etree.ElementTree as ET
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from bridge import Bridge, Handler, SOAP, soap, xml, media_addresses, media_duration
-from unittest.mock import patch
+from bridge import Bridge, Handler, SOAP, soap, xml, media_addresses, media_duration, discover_sonos, select_sonos, speaker_description
+from unittest.mock import patch, MagicMock
 
 class Origin(BaseHTTPRequestHandler):
     seen = []
@@ -168,5 +169,46 @@ class Tests(unittest.TestCase):
         for url in ('http://192.0.2.123/x',self.origin_url+'/bad-redirect'):
             path=self.b.media_url(url,'127.0.0.1').replace(self.b.base,'')
             self.assertEqual(self.request('GET',path)[0],502)
+
+class DiscoveryTests(unittest.TestCase):
+    def test_discovery_filters_and_deduplicates(self):
+        sock = MagicMock()
+        sock.recvfrom.side_effect = [
+            (b'HTTP/1.1 200 OK\r\nLOCATION: http://untrusted.example/\r\n', ('192.168.1.10', 1900)),
+            (b'HTTP/1.1 200 OK', ('192.168.1.10', 1900)),
+            (b'HTTP/1.1 200 OK', ('192.168.1.11', 1900)),
+            (b'HTTP/1.1 200 OK', ('8.8.8.8', 1900)),
+            (b'NOTIFY * HTTP/1.1', ('192.168.1.12', 1900)),
+            socket.timeout(),
+        ]
+        speaker = {'id': 'uuid:one', 'ip': '192.168.1.10', 'name': 'Room', 'model': 'Test'}
+        with patch('bridge.socket.socket') as factory, patch('bridge.speaker_description', side_effect=[speaker, None]) as probe:
+            factory.return_value.__enter__.return_value = sock
+            self.assertEqual(discover_sonos(bind='192.168.1.2'), [speaker])
+        self.assertEqual([call.args[0] for call in probe.call_args_list], ['192.168.1.10', '192.168.1.11'])
+        self.assertIn(b'ZonePlayer:1', sock.sendto.call_args.args[0])
+
+    def test_selection_stable_id_and_multiple_rooms(self):
+        first = {'id': 'uuid:one', 'ip': '192.168.1.10', 'name': 'A', 'model': 'Test'}
+        moved = dict(first, ip='192.168.1.20')
+        other = dict(first, id='uuid:two', name='B')
+        self.assertEqual(select_sonos([first]), first)
+        self.assertEqual(select_sonos([moved, other], 'uuid:one'), moved)
+        with patch('builtins.print'), patch('builtins.input', return_value='2'):
+            self.assertEqual(select_sonos([first, other], interactive=True), other)
+        with patch('builtins.print'):
+            with self.assertRaisesRegex(ValueError, 'Multiple'): select_sonos([first, other])
+        with self.assertRaisesRegex(ValueError, 'No Sonos'): select_sonos([])
+        with self.assertRaisesRegex(ValueError, 'not found'): select_sonos([other], 'uuid:one')
+
+    def test_description_requires_native_sonos(self):
+        document = b'<root><device><deviceType>urn:schemas-upnp-org:device:ZonePlayer:1</deviceType><manufacturer>Sonos, Inc.</manufacturer><UDN>uuid:one</UDN><roomName>Bedroom</roomName><modelName>Play:3</modelName></device></root>'
+        with patch('bridge.OPENER.open') as opener:
+            response = opener.return_value.__enter__.return_value
+            response.read.return_value = document
+            self.assertEqual(speaker_description('192.168.1.10')['name'], 'Bedroom')
+            self.assertEqual(opener.call_args.args[0], 'http://192.168.1.10:1400/xml/device_description.xml')
+            response.read.return_value = document.replace(b'ZonePlayer:1', b'MediaRenderer:1')
+            self.assertIsNone(speaker_description('192.168.1.10'))
 
 if __name__=='__main__':unittest.main(verbosity=2)

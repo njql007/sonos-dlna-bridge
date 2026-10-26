@@ -12,7 +12,7 @@ The bridge runs on an always-awake computer, advertises a virtual renderer, forw
 ## Requirements
 
 - Python 3.9 or later.
-- A Sonos speaker exposing its local UPnP services, and its IP address or hostname.
+- A Sonos speaker exposing its local UPnP services. Its address is discovered automatically.
 - A music app with a DLNA casting option.
 - Phone, bridge computer, and speaker on the same LAN, with multicast discovery allowed.
 - The bridge computer must stay awake and connected throughout playback.
@@ -24,10 +24,10 @@ macOS is the tested host. The standalone Python service can also be tried on Lin
 ```sh
 git clone https://github.com/njql007/sonos-dlna-bridge.git
 cd sonos-dlna-bridge
-python3 bridge.py --target YOUR_SONOS_IP --name 'Sonos DLNA'
+python3 bridge.py --name 'Sonos DLNA'
 ```
 
-Replace `YOUR_SONOS_IP` with your speaker's LAN address or hostname. Allow local-network access when prompted. In the music app's own casting/device picker, select **Sonos DLNA**.
+The bridge discovers Sonos speakers automatically using SSDP. With one speaker it selects it immediately; with several, an interactive terminal lets you choose a room. Allow local-network access when prompted. In the music app's own casting/device picker, select **Sonos DLNA**.
 
 The service uses TCP port `17863` and SSDP multicast on UDP port `1900`. Its startup message prints its LAN URL; append `/status` to inspect counters, subscription count, and the last action/error. Do not expose it through router port forwarding.
 
@@ -35,8 +35,14 @@ Optional arguments:
 
 ```sh
 python3 bridge.py --help
+# List discovered rooms and stable device IDs:
+python3 bridge.py --discover
 # Optional persistent media mappings and rotating logs:
-python3 bridge.py --target YOUR_SONOS_IP --state media-state.json --log bridge.log
+python3 bridge.py --state media-state.json --log bridge.log
+# Select a particular speaker, including in unattended runs:
+python3 bridge.py --speaker 'DEVICE_ID_FROM_DISCOVERY'
+# Manual fallback if multicast discovery is blocked:
+python3 bridge.py --target YOUR_SONOS_IP
 ```
 
 `--bind` selects the local IPv4 address; `--port` changes the HTTP port. By default, the local address is selected from the route to the speaker.
@@ -44,15 +50,17 @@ python3 bridge.py --target YOUR_SONOS_IP --state media-state.json --log bridge.l
 ## Run at login on macOS
 
 ```sh
-python3 manage.py install --target YOUR_SONOS_IP --name 'Sonos DLNA'
+python3 manage.py install --name 'Sonos DLNA'
 python3 manage.py status
 python3 manage.py stop
 python3 manage.py start
 ```
 
+Installation discovers your speakers and lets you select a room when necessary. It saves the selected device ID rather than its current IP, so subsequent starts and periodic network checks can rediscover the same speaker after an address change. You can also pass `--speaker DEVICE_ID` or explicitly override discovery with `--target IP`.
+
 Installation copies `bridge.py` to `~/Library/Application Support/SonosDLNABridge/` and registers `~/Library/LaunchAgents/local.sonos.dlna-bridge.plist`. It runs as the logged-in user, using the Python interpreter that ran the installer. Keep that interpreter available. No administrator access is needed.
 
-To apply source updates, repeat the install command with your target and desired name. This restarts the bridge and clears active event subscriptions. Fully close and reopen the music app, then select the renderer again if its controls become out of sync.
+To apply source updates, repeat the install command and select the same room and desired name. This restarts the bridge and clears active event subscriptions. Fully close and reopen the music app, then select the renderer again if its controls become out of sync.
 
 ```sh
 python3 manage.py uninstall
@@ -73,7 +81,8 @@ Uninstall stops the service and removes its login registration; installed files,
 
 ## Implementation
 
-- SSDP discovery and periodic announcements for a virtual MediaRenderer.
+- SSDP discovery of native Sonos speakers, room selection, and stable device-ID matching across IP changes.
+- SSDP discovery responses and periodic announcements for a virtual MediaRenderer.
 - Device/service descriptions derived from the target Sonos, with an allowlist of playback and volume actions.
 - SOAP forwarding with backend errors preserved, serialized transport controls, and state readbacks ordered after pending operations.
 - HTTP audio relay with HEAD, Range, redirect handling, and original-URI restoration in client responses.
